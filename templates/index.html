@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RFID Cards</title>
+</head>
+<body>
+    <h1>RFID Cards</h1>
+
+    <table border="1">
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>RFID</th>
+            <th>Is Admin</th>
+        </tr>
+
+        {% for user in users %}
+        <tr>
+            <td>{{ user.id }}</td>
+            <td>{{ user.name }}</td>
+            <td>{{ user.rfid }}</td>
+            <td>{{ user.isadmin }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+</body>
+</html>
