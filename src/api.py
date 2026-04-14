@@ -1,17 +1,17 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi import Request
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 import os
+import hmac
+import hashlib
+import time
 
 # ---- DATABASE CONFIG ----
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
-# For Render PostgreSQL use:
-# DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(
     DATABASE_URL,
@@ -41,7 +41,36 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# Dependency
+# ---- SECURITY CONFIG ----
+
+# 🔐 Match Arduino
+DEVICE_KEYS = {
+    "esp_1": b"super_random_32+_char_secret"
+}
+
+MAX_TIME_DIFF = 30  # seconds
+
+
+def verify_signature(device_id, uid, timestamp, signature):
+    if device_id not in DEVICE_KEYS:
+        return False
+
+    secret = DEVICE_KEYS[device_id]
+
+    # MUST MATCH Arduino EXACTLY
+    payload = f"{device_id}|{uid}|{timestamp}".encode()
+
+    expected = hmac.new(
+        secret,
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+# ---- DEPENDENCY ----
+
 def get_db():
     db = SessionLocal()
     try:
@@ -49,23 +78,42 @@ def get_db():
     finally:
         db.close()
 
-# ---- POST: Add RFID ----
 
-class RFIDRequest(BaseModel):
-    rfid: str
+# ---- REQUEST MODEL (NEW) ----
+
+class ScanRequest(BaseModel):
+    device_id: str
+    uid: str
+    timestamp: int
+    signature: str
+
+
+# ---- POST: Add RFID (SECURE) ----
 
 @app.post("/scan")
-def scan_card(data: RFIDRequest, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.rfid == data.rfid).first()
+def scan_card(data: ScanRequest, db: Session = Depends(get_db)):
+    # ⏱️ Anti-replay
+    now = int(time.time())
+    if abs(now - data.timestamp) > MAX_TIME_DIFF:
+        raise HTTPException(status_code=401, detail="Request expired")
+
+    # 🔐 Verify HMAC
+    if not verify_signature(data.device_id, data.uid, data.timestamp, data.signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # ✅ Check if exists
+    existing = db.query(User).filter(User.rfid == data.uid).first()
     if existing:
         return {"message": "RFID already exists"}
 
-    new_user = User(rfid=data.rfid)
+    # ✅ Save new RFID
+    new_user = User(rfid=data.uid)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
     return {"message": "RFID added", "rfid": new_user.rfid}
+
 
 # ---- GET: Check RFID ----
 
@@ -76,12 +124,14 @@ def check_rfid(rfid: str, db: Session = Depends(get_db)):
         return {"status": "accept"}
     return {"status": "denied"}
 
+
 # ---- GET: All Users ----
 
 @app.get("/users")
 def get_all_users(db: Session = Depends(get_db)):
     users = db.query(User).all()
     return users
+
 
 # ---- WEBPAGE ----
 
