@@ -13,6 +13,15 @@ import time
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
 
+apikey = os.getenv("ESP1_SECRET")
+
+if apikey is None:
+    raise Exception("ESP1_SECRET is not set")
+
+apikey = apikey.encode()
+
+
+
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
@@ -45,7 +54,7 @@ templates = Jinja2Templates(directory="templates")
 
 # 🔐 Match Arduino
 DEVICE_KEYS = {
-    "esp_1": b"super_random_32+_char_secret"
+    "esp_1": apikey
 }
 
 MAX_TIME_DIFF = 30  # seconds
