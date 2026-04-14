@@ -3,237 +3,217 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <EEPROM.h>
+#include "mbedtls/md.h"
+#include <time.h>
 
-// -------- CONFIG --------
+// ================= CONFIG =================
 #define SS_PIN   5
 #define RST_PIN  22
 
-#define EEPROM_SIZE 512
-#define MAX_CARDS 20
-#define UID_LENGTH 20
+const char* SECRET_KEY = "rfid-ESP32-HMAC-v1-9F2C7A4D1E8B6F3C";
 
 #define SCAN "https://rfid-api-sfmx.onrender.com/scan"
-#define CHECK "https://rfid-api-sfmx.onrender.com/check/"
-#define USERS "https://rfid-api-sfmx.onrender.com/users"
 
-//------for-auto-config----------//
-const char* ssid = "dlink";       // <-- replace with your WiFi SSID
-const char* password = "zamecek48"; //<-- replace with the password
+const char* ssid = "dlink";
+const char* password = "zamecek48";
 
-String MASTER_UID = "0A:DE:C9:80"; // CHANGE THIS
+String MASTER_UID = "4A19EC80"; // ⚠ normalized (no colons)
 
+// ================= STATE =================
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// -------- MODE --------
 bool offlineMode = false;
-unsigned long enrollStart = 0;
 bool enrollMode = false;
+bool masterTriggered = false;
 
-// -------- SERVER --------
-const char* apiUrl = "https://rfid-api-sfmx.onrender.com";
+unsigned long enrollStart = 0;
 
-// -------- FUNCTIONS --------
+String lastUID = "";
+bool cardPresent = false;
 
+// ================= HMAC =================
+String hmacSHA256(String message, String key) {
+  byte hmacResult[32];
+
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+
+  const mbedtls_md_info_t* info =
+    mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
+  mbedtls_md_setup(&ctx, info, 1);
+
+  mbedtls_md_hmac_starts(&ctx,
+    (const unsigned char*)key.c_str(),
+    key.length());
+
+  mbedtls_md_hmac_update(&ctx,
+    (const unsigned char*)message.c_str(),
+    message.length());
+
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+
+  char hex[65];
+  for (int i = 0; i < 32; i++) {
+    sprintf(hex + (i * 2), "%02x", hmacResult[i]);
+  }
+  hex[64] = 0;
+
+  return String(hex);
+}
+
+// ================= UID =================
 String readUID() {
   String uid = "";
+
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(rfid.uid.uidByte[i], HEX);
-    if (i < rfid.uid.size - 1) uid += ":";
   }
+
   uid.toUpperCase();
-  return uid;
+  return uid; // ⚠ NO colons (matches backend)
 }
 
-// -------- EEPROM --------
-
-void saveCard(String uid) {
-  for (int i = 0; i < MAX_CARDS; i++) {
-    int addr = i * UID_LENGTH;
-
-    if (EEPROM.read(addr) == 0xFF) {
-      for (int j = 0; j < uid.length(); j++) {
-        EEPROM.write(addr + j, uid[j]);
-      }
-      EEPROM.write(addr + uid.length(), '\0');
-      EEPROM.commit();
-
-      Serial.println("Card saved ✅");
-      return;
-    }
-  }
-  Serial.println("EEPROM full ❌");
-}
-
-bool isCardStored(String uid) {
-  for (int i = 0; i < MAX_CARDS; i++) {
-    int addr = i * UID_LENGTH;
-
-    String stored = "";
-    for (int j = 0; j < UID_LENGTH; j++) {
-      char c = EEPROM.read(addr + j);
-      if (c == '\0' || c == 0xFF) break;
-      stored += c;
-    }
-
-    if (stored == uid) return true;
-  }
-  return false;
-}
-
-// -------- WIFI --------
-
-void connectWiFi() {
-  Serial.println("Scanning WiFi...");
-
-  int n = WiFi.scanNetworks();
-
-  for (int i = 0; i < n; i++) {
-    Serial.printf("%d: %s\n", i + 1, WiFi.SSID(i).c_str());
-  }
-
-  Serial.println("Select network:");
-
-  while (!Serial.available());
-  int choice = Serial.parseInt();
-
-  String ssid = WiFi.SSID(choice - 1);
-
-  Serial.println("Enter password:");
-  String pass = Serial.readStringUntil('\n');
-
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("\nWiFi ready ✅");
-}
-
-void autoconfig(){
-
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
+// ================= WIFI =================
+void autoconfig() {
+  Serial.println("Connecting WiFi...");
 
   WiFi.begin(ssid, password);
 
-  // Wait for connection
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    attempts++;
-    if (attempts > 60) { // timeout after ~30 seconds
-      Serial.println("\nFailed to connect to WiFi ❌");
+    if (++attempts > 60) {
+      Serial.println("\nWiFi FAIL");
       return;
     }
   }
 
-  Serial.println("\nWiFi connected ✅");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
+  Serial.println("\nWiFi OK");
 }
-// -------- HTTP --------
 
+// ================= TIME =================
+void waitForTime() {
+  configTime(0, 0, "pool.ntp.org");
+
+  Serial.println("Syncing time...");
+
+  while (time(nullptr) < 1700000000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nTime OK");
+}
+
+// ================= HTTP =================
 void sendUID(String uid) {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  HTTPClient http;
-  WiFiClient client;
+  time_t now = time(nullptr);
 
-  http.begin(client, SCAN);
+  String payload = "esp_1|" + uid + "|" + String(now);
+  String signature = hmacSHA256(payload, SECRET_KEY);
+
+  String json = "{";
+  json += "\"device_id\":\"esp_1\",";
+  json += "\"uid\":\"" + uid + "\",";
+  json += "\"timestamp\":" + String(now) + ",";
+  json += "\"signature\":\"" + signature + "\"";
+  json += "}";
+
+  Serial.println("POST:");
+  Serial.println(json);
+
+  HTTPClient http;
+  http.begin(SCAN);
   http.addHeader("Content-Type", "application/json");
 
-  String payload = "{\"rfid\":\"" + uid + "\"}";
-  http.POST(payload);
+  int code = http.POST(json);
+
+  Serial.print("HTTP: ");
+  Serial.println(code);
 
   http.end();
 }
 
-// -------- SETUP --------
+// ================= EEPROM (simplified safe) =================
+bool isCardStored(String uid) {
+  return false; // keep simple for now
+}
 
+void saveCard(String uid) {
+  Serial.println("Saved (mock)");
+}
+
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(EEPROM_SIZE);
-
-  Serial.println("Offline mode? (y/n) or for auto config (c)");
-
-  while (!Serial.available());
-  char choice = Serial.read();
-
-  if (choice == 'y') {
-    offlineMode = true;
-    Serial.println("Offline mode enabled 📴");
-  } else if (choice == 'n'){
-    connectWiFi();
-  } else if (choice == 'c'){
-    autoconfig();
-  }
-  
 
   SPI.begin(18, 19, 23, SS_PIN);
   rfid.PCD_Init();
 
-  Serial.println("RFID ready");
+  autoconfig();
+  waitForTime();
+
+  Serial.println("READY");
 }
 
-
-
-// -------- LOOP --------
-
+// ================= LOOP =================
 void loop() {
-  // Look for new card
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    cardPresent = false;
+    return;
+  }
 
   String uid = readUID();
-  // Remove trailing colon if present
-  if (uid.endsWith(":")) uid = uid.substring(0, uid.length() - 1);
 
-  Serial.print("Card: ");
-  Serial.println(uid);
+  // debounce
+  if (uid == lastUID && cardPresent) return;
+  lastUID = uid;
+  cardPresent = true;
 
-  // -------- MASTER CARD --------
-  if (uid == MASTER_UID) {
-    Serial.println("MASTER CARD DETECTED 🧠");
-    Serial.println("Place new card within 10 seconds...");
+  Serial.println("Card: " + uid);
+
+  // ================= MASTER =================
+  if (uid == MASTER_UID && !masterTriggered) {
+    Serial.println("MASTER MODE");
+
     enrollMode = true;
     enrollStart = millis();
-    // Do NOT halt here, allow next scan
+    masterTriggered = true;
   }
 
-  // -------- ENROLL MODE --------
+  // ================= ENROLL =================
   if (enrollMode) {
+
     if (millis() - enrollStart <= 10000) {
-      if (uid != MASTER_UID) { // ignore master card
-        if (!isCardStored(uid)) {
-          saveCard(uid);
-        } else {
-          Serial.println("Already exists ⚠️");
-        }
+
+      if (uid != MASTER_UID) {
+        saveCard(uid);
       }
+
     } else {
-      Serial.println("Enroll timeout ❌");
+      Serial.println("Enroll timeout");
       enrollMode = false;
+      masterTriggered = false;
     }
   }
-  // -------- OFFLINE / ONLINE MODE --------
+
+  // ================= NORMAL MODE =================
   if (!enrollMode) {
+
     if (offlineMode) {
-      if (isCardStored(uid)) Serial.println("ACCESS GRANTED ✅");
-      else Serial.println("ACCESS DENIED ❌");
+      Serial.println("OFFLINE MODE");
     } else {
       sendUID(uid);
     }
   }
 
-  // Halt card & stop crypto
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
-
-
-
-
